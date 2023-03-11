@@ -1,6 +1,6 @@
 name: lightning_runner
 description: Implement your native HMR easily on your Dart project.
-version: 1.0.0
+version: 1.0.1
 repository: https://github.com/LeadcodeDev/lightning_runner
 
 executables:
