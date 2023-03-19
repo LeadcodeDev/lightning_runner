@@ -22,22 +22,30 @@ class LightningRunner {
   final bool Function(BeforeReloadContext ctx)? onBeforeReload;
   final void Function(AfterReloadContext ctx)? onAfterReload;
   final void Function(Directory directory)? onDirectoryWatching;
+
+  final void Function(List<String>)? onStartRunner;
   final void Function(File file)? onFileChange;
   final void Function(File file)? onFileCreate;
   final void Function(File file)? onFileDelete;
 
+  final List<String> locations;
+  final File entrypoint;
   final Duration debounceInterval;
   final _watchedStreams = <StreamSubscription<List<WatchEvent>>>{};
   final bool watchDependencies;
   late VmService _vmService;
+  isolates.Isolate? _isolate;
 
 
   LightningRunner({
+    required this.entrypoint,
+    required this.locations,
     this.watchDependencies = true,
     this.debounceInterval = const Duration(seconds: 1),
     this.onBeforeReload,
     this.onAfterReload,
     this.onDirectoryWatching,
+    this.onStartRunner,
     this.onFileChange,
     this.onFileCreate,
     this.onFileDelete,
@@ -54,7 +62,7 @@ class LightningRunner {
       await stop();
     }
 
-    List<String> watchList = ['bin', 'lib', 'test'];
+    List<String> watchList = locations;
 
     if (watchDependencies) {
       final pkgConfigURL = await isolates.Isolate.packageConfig;
@@ -79,7 +87,7 @@ class LightningRunner {
       }
     }
 
-    watchList = watchList.map(absolute).map(normalize).toSet().toList();
+    watchList = watchList.map(normalize).toSet().toList();
     watchList.sort();
 
     final isDockerized = await isRunningInDockerContainer;
@@ -96,16 +104,16 @@ class LightningRunner {
 
       final fileType = FileSystemEntity.typeSync(path);
       if (fileType == FileSystemEntityType.file) {
-        watchers.add(isDockerized //
-          ? PollingFileWatcher(path, pollingDelay: debounceInterval) //
-          : FileWatcher(path) //
+        watchers.add(isDockerized
+          ? PollingFileWatcher(path, pollingDelay: debounceInterval)
+          : FileWatcher(path)
         );
       } else if (fileType == FileSystemEntityType.notFound) {
         watchers.add(PollingDirectoryWatcher(path, pollingDelay: debounceInterval));
       } else {
         watchers.add(isDockerized
-            ? PollingDirectoryWatcher(path, pollingDelay: debounceInterval)
-            : DirectoryWatcher(path));
+          ? PollingDirectoryWatcher(path, pollingDelay: debounceInterval)
+          : DirectoryWatcher(path));
       }
     }
 
@@ -119,6 +127,7 @@ class LightningRunner {
         .listen(_onFilesModified);
 
       await watcher.ready;
+
       _watchedStreams.add(watchedStream);
     }
   }
@@ -147,6 +156,10 @@ class LightningRunner {
               noVeto = false;
             }
           }
+        }
+
+        if (_isolate != null) {
+          _isolate!.kill();
         }
       }
 
@@ -179,6 +192,8 @@ class LightningRunner {
 
     if (failedReloadReports.isEmpty) {
       onAfterReload?.call(AfterReloadContext(changes, reloadReports, LightningResult.succeeded));
+      _startEntrypointProcess();
+
       return LightningResult.succeeded;
     }
 
@@ -188,7 +203,17 @@ class LightningRunner {
     }
 
     onAfterReload?.call(AfterReloadContext(changes, reloadReports, LightningResult.partiallySucceeded));
+    _startEntrypointProcess();
+
     return LightningResult.partiallySucceeded;
+  }
+
+  Future<void> _startEntrypointProcess () async {
+    final receiverPort = isolates.ReceivePort();
+
+    _isolate = await isolates.Isolate.spawnUri(entrypoint.uri, [], receiverPort.sendPort);
+
+    receiverPort.listen(print);
   }
 
   Future<void> _onFilesModified(final List<WatchEvent> changes) async {
@@ -198,6 +223,7 @@ class LightningRunner {
     if (changes.isEmpty) {
       return;
     }
+
 
     if (onFileChange != null) {
       for (final event in changes) {
@@ -209,7 +235,7 @@ class LightningRunner {
           onFileCreate!(File(event.path));
         }
 
-        if (event.type == ChangeType.MODIFY && onFileDelete != null) {
+        if (event.type == ChangeType.MODIFY && onFileChange != null) {
           onFileChange!(File(event.path));
         }
       }
@@ -225,8 +251,13 @@ class LightningRunner {
   }
 
   Future<void> watch () async {
+    if (onStartRunner != null) {
+      onStartRunner!(locations);
+    }
+
     _vmService = await createVmService();
     await _registerWatchers();
+    await _startEntrypointProcess();
   }
 
   Future<void> stop() async {
